@@ -2,6 +2,9 @@ use super::{stream::FormatErrorInner, DecodingError, CHUNCK_BUFFER_SIZE};
 
 use fdeflate::Decompressor;
 
+/// How far back inflate may need to look.
+const LOOKBACK_SIZE: usize = 32 * 1024;
+
 /// Ergonomics wrapper around `miniz_oxide::inflate::stream` for zlib compressed data.
 pub(super) struct ZlibStream {
     /// Current decoding state.
@@ -44,7 +47,7 @@ impl ZlibStream {
             started: false,
             in_buffer: Vec::with_capacity(CHUNCK_BUFFER_SIZE),
             in_pos: 0,
-            out_buffer: vec![0; 2 * CHUNCK_BUFFER_SIZE],
+            out_buffer: vec![0; LOOKBACK_SIZE + CHUNCK_BUFFER_SIZE],
             out_pos: 0,
             ignore_adler32: true,
         }
@@ -203,7 +206,7 @@ impl ZlibStream {
     }
 
     fn transfer_finished_data(&mut self, image_data: &mut Vec<u8>) -> usize {
-        let safe = self.out_pos.saturating_sub(CHUNCK_BUFFER_SIZE);
+        let safe = self.out_pos.saturating_sub(LOOKBACK_SIZE);
         // TODO: allocation limits.
         image_data.extend(self.out_buffer.drain(..safe));
         self.out_pos -= safe;

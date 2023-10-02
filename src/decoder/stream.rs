@@ -19,7 +19,7 @@ use crate::text_metadata::{ITXtChunk, TEXtChunk, TextDecodingError, ZTXtChunk};
 use crate::traits::ReadBytesExt;
 
 /// TODO check if these size are reasonable
-pub const CHUNCK_BUFFER_SIZE: usize = 32 * 1024;
+pub const CHUNCK_BUFFER_SIZE: usize = 1024;
 
 /// Determines if checksum checks should be disabled globally.
 ///
