@@ -130,8 +130,6 @@ pub(crate) enum FormatErrorInner {
     InvalidSignature,
     /// End of file, within a chunk event.
     UnexpectedEof,
-    /// End of file, while expecting more image data.
-    UnexpectedEndOfChunk,
     // Errors of chunk level ordering, missing etc.
     /// Ihdr must occur.
     MissingIhdr,
@@ -287,7 +285,6 @@ impl fmt::Display for FormatError {
             BadSubFrameBounds {} => write!(fmt, "Sub frame is out-of-bounds."),
             InvalidSignature => write!(fmt, "Invalid PNG signature."),
             UnexpectedEof => write!(fmt, "Unexpected end of data before image end."),
-            UnexpectedEndOfChunk => write!(fmt, "Unexpected end of data within a chunk."),
             NoMoreImageData => write!(fmt, "IDAT or fDAT chunk is has not enough data for image."),
             CorruptFlateStream { err } => {
                 write!(fmt, "Corrupt deflate stream. ")?;
@@ -518,15 +515,11 @@ impl StreamingDecoder {
     ///
     /// Allows to stream partial data to the encoder. Returns a tuple containing the bytes that have
     /// been consumed from the input buffer and the current decoding result. If the decoded chunk
-    /// was an image data chunk, it also appends the read data to `image_data`.
-    pub fn update(
-        &mut self,
-        mut buf: &[u8],
-        image_data: &mut Vec<u8>,
-    ) -> Result<(usize, Decoded), DecodingError> {
+    /// was an image data chunk, it can be read later via `image_data_reader`.
+    pub fn update(&mut self, mut buf: &[u8]) -> Result<(usize, Decoded), DecodingError> {
         let len = buf.len();
         while !buf.is_empty() && self.state.is_some() {
-            match self.next_state(buf, image_data) {
+            match self.next_state(buf) {
                 Ok((bytes, Decoded::Nothing)) => buf = &buf[bytes..],
                 Ok((bytes, result)) => {
                     buf = &buf[bytes..];
@@ -538,11 +531,7 @@ impl StreamingDecoder {
         Ok((len - buf.len(), Decoded::Nothing))
     }
 
-    fn next_state<'a>(
-        &'a mut self,
-        buf: &[u8],
-        image_data: &mut Vec<u8>,
-    ) -> Result<(usize, Decoded), DecodingError> {
+    fn next_state<'a>(&'a mut self, buf: &[u8]) -> Result<(usize, Decoded), DecodingError> {
         use self::State::*;
 
         let current_byte = buf[0];
@@ -585,8 +574,7 @@ impl StreamingDecoder {
                                 || self.current_chunk.type_ == chunk::fdAT)
                         {
                             self.current_chunk.type_ = type_str;
-                            self.inflater.finish_compressed_chunks(image_data)?;
-                            self.inflater.reset();
+                            self.inflater.finish_compressed_chunks()?;
                             self.state = Some(U32Byte3(Type(length), val & !0xff));
                             return Ok((0, Decoded::ImageDataFlushed));
                         }
@@ -735,7 +723,7 @@ impl StreamingDecoder {
             DecodeData(type_str, mut n) => {
                 let chunk_len = self.current_chunk.raw_bytes.len();
                 let chunk_data = &self.current_chunk.raw_bytes[n..];
-                let c = self.inflater.decompress(chunk_data, image_data)?;
+                let c = self.inflater.decompress(chunk_data)?;
                 n += c;
                 if n == chunk_len && c == 0 {
                     self.current_chunk.raw_bytes.clear();
@@ -1122,17 +1110,17 @@ impl StreamingDecoder {
                 }
             }
 
-            let mut profile = Vec::new();
             let mut inflater = ZlibStream::new();
             while !buf.is_empty() {
-                let consumed_bytes = inflater.decompress(buf, &mut profile)?;
-                if profile.len() > 8000000 {
-                    // TODO: this should use Limits.bytes
-                    return Err(DecodingError::LimitsExceeded);
-                }
+                let consumed_bytes = inflater.decompress(buf)?;
                 buf = &buf[consumed_bytes..];
             }
-            inflater.finish_compressed_chunks(&mut profile)?;
+            inflater.finish_compressed_chunks()?;
+            let profile = inflater.into_vec();
+            if profile.len() > 8000000 {
+                // TODO: this should use Limits.bytes
+                return Err(DecodingError::LimitsExceeded);
+            }
 
             info.icc_profile = Some(Cow::Owned(profile));
             Ok(Decoded::Nothing)
@@ -1140,6 +1128,7 @@ impl StreamingDecoder {
     }
 
     fn parse_ihdr(&mut self) -> Result<Decoded, DecodingError> {
+        self.inflater.reset();
         if self.info.is_some() {
             return Err(DecodingError::Format(
                 FormatErrorInner::DuplicateChunk { kind: IHDR }.into(),
@@ -1311,6 +1300,10 @@ impl StreamingDecoder {
         );
 
         Ok(Decoded::Nothing)
+    }
+
+    pub fn image_data_reader(&mut self) -> &mut impl std::io::Read {
+        &mut self.inflater
     }
 }
 

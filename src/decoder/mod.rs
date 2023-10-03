@@ -188,10 +188,8 @@ impl<R: Read> Decoder<R> {
     /// Most image metadata will not be read until `read_info` is called, so those fields will be
     /// None or empty.
     pub fn read_header_info(&mut self) -> Result<&Info, DecodingError> {
-        let mut buf = Vec::new();
         while self.read_decoder.info().is_none() {
-            buf.clear();
-            if self.read_decoder.decode_next(&mut buf)?.is_none() {
+            if self.read_decoder.decode_next()?.is_none() {
                 return Err(DecodingError::Format(
                     FormatErrorInner::UnexpectedEof.into(),
                 ));
@@ -212,7 +210,6 @@ impl<R: Read> Decoder<R> {
             next_frame: SubframeIdx::Initial,
             prev: Vec::new(),
             current: Vec::new(),
-            scan_start: 0,
             transform: self.transform,
             scratch_buffer: Vec::new(),
             limits: self.limits,
@@ -281,9 +278,9 @@ struct ReadDecoder<R: Read> {
 }
 
 impl<R: Read> ReadDecoder<R> {
-    /// Returns the next decoded chunk. If the chunk is an ImageData chunk, its contents are written
-    /// into image_data.
-    fn decode_next(&mut self, image_data: &mut Vec<u8>) -> Result<Option<Decoded>, DecodingError> {
+    /// Returns the next decoded chunk. If the chunk is an ImageData chunk, its contents can later
+    /// be retrieved via `image_data_reader`.
+    fn decode_next(&mut self) -> Result<Option<Decoded>, DecodingError> {
         while !self.at_eof {
             let (consumed, result) = {
                 let buf = self.reader.fill_buf()?;
@@ -292,7 +289,7 @@ impl<R: Read> ReadDecoder<R> {
                         FormatErrorInner::UnexpectedEof.into(),
                     ));
                 }
-                self.decoder.update(buf, image_data)?
+                self.decoder.update(buf)?
             };
             self.reader.consume(consumed);
             match result {
@@ -312,7 +309,7 @@ impl<R: Read> ReadDecoder<R> {
                     FormatErrorInner::UnexpectedEof.into(),
                 ));
             }
-            let (consumed, event) = self.decoder.update(buf, &mut vec![])?;
+            let (consumed, event) = self.decoder.update(buf)?;
             self.reader.consume(consumed);
             match event {
                 Decoded::Nothing => (),
@@ -351,8 +348,6 @@ pub struct Reader<R: Read> {
     prev: Vec<u8>,
     /// Current raw line
     current: Vec<u8>,
-    /// Start index of the current scan line.
-    scan_start: usize,
     /// Output transformations
     transform: Transformations,
     /// This buffer is only used so that `next_row` and `next_interlaced_row` can return reference
@@ -401,13 +396,7 @@ impl<R: Read> Reader<R> {
     /// Requires IHDR before the IDAT and fcTL before fdAT.
     fn read_until_image_data(&mut self) -> Result<(), DecodingError> {
         loop {
-            // This is somewhat ugly. The API requires us to pass a buffer to decode_next but we
-            // know that we will stop before reading any image data from the stream. Thus pass an
-            // empty buffer and assert that remains empty.
-            let mut buf = Vec::new();
-            let state = self.decoder.decode_next(&mut buf)?;
-            assert!(buf.is_empty());
-
+            let state = self.decoder.decode_next()?;
             match state {
                 Some(Decoded::ChunkBegin(_, chunk::IDAT))
                 | Some(Decoded::ChunkBegin(_, chunk::fdAT)) => break,
@@ -505,7 +494,6 @@ impl<R: Read> Reader<R> {
         };
 
         self.current.clear();
-        self.scan_start = 0;
         let width = self.info().width;
         if self.info().interlaced {
             while let Some(InterlacedRow {
@@ -720,46 +708,42 @@ impl<R: Read> Reader<R> {
 
     /// Write the next raw interlaced row into `self.prev`.
     ///
-    /// The scanline is filtered against the previous scanline according to the specification.
+    /// The scanline is unfiltered against the previous scanline according to the specification.
     fn next_raw_interlaced_row(&mut self, rowlen: usize) -> Result<(), DecodingError> {
-        // Read image data until we have at least one full row (but possibly more than one).
-        while self.current.len() - self.scan_start < rowlen {
-            if self.subframe.consumed_and_flushed {
-                return Err(DecodingError::Format(
-                    FormatErrorInner::NoMoreImageData.into(),
-                ));
-            }
+        let mut current = vec![0u8; rowlen];
 
-            // Clear the current buffer before appending more data.
-            if self.scan_start > 0 {
-                self.current.drain(..self.scan_start).for_each(drop);
-                self.scan_start = 0;
-            }
-
-            match self.decoder.decode_next(&mut self.current)? {
-                Some(Decoded::ImageData) => {}
-                Some(Decoded::ImageDataFlushed) => {
-                    self.subframe.consumed_and_flushed = true;
-                }
-                None => {
+        // Read image data until we have a whole row.
+        {
+            let mut cursor = current.as_mut_slice();
+            while !cursor.is_empty() {
+                if self.subframe.consumed_and_flushed {
                     return Err(DecodingError::Format(
-                        if self.current.is_empty() {
-                            FormatErrorInner::NoMoreImageData
-                        } else {
-                            FormatErrorInner::UnexpectedEndOfChunk
-                        }
-                        .into(),
+                        FormatErrorInner::NoMoreImageData.into(),
                     ));
                 }
-                _ => (),
+
+                let new_bytes = self.decoder.decoder.image_data_reader().read(cursor)?;
+                cursor = &mut cursor[new_bytes..];
+
+                if new_bytes == 0 {
+                    match self.decoder.decode_next()? {
+                        Some(Decoded::ImageData) => {}
+                        Some(Decoded::ImageDataFlushed) => {
+                            self.subframe.consumed_and_flushed = true;
+                        }
+                        None => {
+                            return Err(DecodingError::Format(
+                                FormatErrorInner::NoMoreImageData.into(),
+                            ));
+                        }
+                        _ => (),
+                    }
+                }
             }
         }
 
-        // Get a reference to the current row and point scan_start to the next one.
-        let row = &mut self.current[self.scan_start..];
-        self.scan_start += rowlen;
-
         // Unfilter the row.
+        let row = &mut current;
         let filter = FilterType::from_u8(row[0]).ok_or(DecodingError::Format(
             FormatErrorInner::UnknownFilterMethod(row[0]).into(),
         ))?;

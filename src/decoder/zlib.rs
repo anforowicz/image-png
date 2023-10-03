@@ -30,7 +30,10 @@ pub(super) struct ZlibStream {
     /// The decoder sometimes wants inspect some already finished bytes for further decoding. So we
     /// keep a total of 32KB of decoded data available as long as more data may be appended.
     out_buffer: Vec<u8>,
-    /// The cursor position in the output stream as a buffer index.
+    /// Index into `out_buffer` - points at the 1st decompressed byte that hasn't been `read` yet.
+    reader_pos: usize,
+    /// Index into `out_buffer` - 1 byte past the already decompressed data (i.e. pointing at
+    /// where newly decompressed data may be written).
     out_pos: usize,
     /// Ignore and do not calculate the Adler-32 checksum. Defaults to `true`.
     ///
@@ -48,6 +51,7 @@ impl ZlibStream {
             in_buffer: Vec::with_capacity(CHUNCK_BUFFER_SIZE),
             in_pos: 0,
             out_buffer: vec![0; LOOKBACK_SIZE + CHUNCK_BUFFER_SIZE],
+            reader_pos: 0,
             out_pos: 0,
             ignore_adler32: true,
         }
@@ -58,6 +62,7 @@ impl ZlibStream {
         self.in_buffer.clear();
         self.in_pos = 0;
         self.out_buffer.clear();
+        self.reader_pos = 0;
         self.out_pos = 0;
         *self.state = Decompressor::new();
     }
@@ -85,11 +90,7 @@ impl ZlibStream {
 
     /// Fill the decoded buffer as far as possible from `data`.
     /// On success returns the number of consumed input bytes.
-    pub(crate) fn decompress(
-        &mut self,
-        data: &[u8],
-        image_data: &mut Vec<u8>,
-    ) -> Result<usize, DecodingError> {
+    pub(crate) fn decompress(&mut self, data: &[u8]) -> Result<usize, DecodingError> {
         self.prepare_vec_for_appending();
 
         if !self.started && self.ignore_adler32 {
@@ -126,7 +127,7 @@ impl ZlibStream {
 
         self.started = true;
         self.out_pos += out_consumed;
-        self.transfer_finished_data(image_data);
+        self.compact_out_buffer_if_needed();
 
         Ok(in_consumed)
     }
@@ -136,25 +137,18 @@ impl ZlibStream {
     /// The compressed stream can be split on arbitrary byte boundaries. This enables some cleanup
     /// within the decompressor and flushing additional data which may have been kept back in case
     /// more data were passed to it.
-    pub(crate) fn finish_compressed_chunks(
-        &mut self,
-        image_data: &mut Vec<u8>,
-    ) -> Result<(), DecodingError> {
+    pub(crate) fn finish_compressed_chunks(&mut self) -> Result<(), DecodingError> {
         if !self.started {
             return Ok(());
         }
 
-        let tail = self.in_buffer.split_off(0);
-        let tail = &tail[self.in_pos..];
-
-        let mut start = 0;
         loop {
             self.prepare_vec_for_appending();
 
             let (in_consumed, out_consumed) = self
                 .state
                 .read(
-                    &tail[start..],
+                    &self.in_buffer[self.in_pos..],
                     self.out_buffer.as_mut_slice(),
                     self.out_pos,
                     true,
@@ -163,19 +157,20 @@ impl ZlibStream {
                     DecodingError::Format(FormatErrorInner::CorruptFlateStream { err }.into())
                 })?;
 
-            start += in_consumed;
+            self.in_pos += in_consumed;
             self.out_pos += out_consumed;
 
             if self.state.is_done() {
-                self.out_buffer.truncate(self.out_pos);
-                image_data.append(&mut self.out_buffer);
                 return Ok(());
+            } else if in_consumed == 0 && out_consumed == 0 {
+                return Err(DecodingError::Format(
+                    FormatErrorInner::CorruptFlateStream {
+                        err: fdeflate::DecompressionError::InsufficientInput,
+                    }
+                    .into(),
+                ));
             } else {
-                let transferred = self.transfer_finished_data(image_data);
-                assert!(
-                    transferred > 0 || in_consumed > 0 || out_consumed > 0,
-                    "No more forward progress made in stream decoding."
-                );
+                self.compact_out_buffer_if_needed();
             }
         }
     }
@@ -205,11 +200,40 @@ impl ZlibStream {
             .min(isize::max_value() as usize)
     }
 
-    fn transfer_finished_data(&mut self, image_data: &mut Vec<u8>) -> usize {
-        let safe = self.out_pos.saturating_sub(LOOKBACK_SIZE);
-        // TODO: allocation limits.
-        image_data.extend(self.out_buffer.drain(..safe));
-        self.out_pos -= safe;
-        safe
+    // TODO: Compacting the `out_buffer` effectively flushes out the L1 cache which seems
+    // undesirable.  Consider avoiding this somehow:
+    // * Compact less often?
+    // * Use a cicrular ring buffer (requires tweaks to `fdeflate`)?
+    fn compact_out_buffer_if_needed(&mut self) {
+        let safe = std::cmp::min(self.reader_pos, self.out_pos.saturating_sub(LOOKBACK_SIZE));
+        if safe != 0 {
+            // Compact `out_buffer` by shifting all the non-discardable byte to the left (i.e. to
+            // position 0).
+            self.out_buffer.copy_within(safe..self.out_pos, 0);
+            self.out_pos -= safe;
+            self.reader_pos -= safe;
+            self.out_buffer.truncate(self.out_pos);
+        }
+    }
+
+    /// Returns the decompressed output.  This is an alternative to `self.read_to_end` that doesn't
+    /// require copying of the data.
+    pub(crate) fn into_vec(mut self) -> Vec<u8> {
+        if self.reader_pos != 0 {
+            self.out_buffer
+                .copy_within(self.reader_pos..self.out_pos, 0);
+            self.out_pos -= self.reader_pos;
+        }
+        self.out_buffer.truncate(self.out_pos);
+        self.out_buffer
+    }
+}
+
+impl std::io::Read for ZlibStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::cmp::min(buf.len(), self.out_pos - self.reader_pos);
+        buf[0..n].copy_from_slice(&self.out_buffer[self.reader_pos..self.reader_pos + n]);
+        self.reader_pos += n;
+        Ok(n)
     }
 }
