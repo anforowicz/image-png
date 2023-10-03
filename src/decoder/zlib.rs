@@ -210,8 +210,7 @@ impl ZlibStream {
         if target_len > self.out_buffer.capacity() {
             // Only discard "safe" bytes: ones that have already been read and are not needed for
             // inflate algorithm look-back.
-            let safe =
-                std::cmp::min(self.reader_pos, self.out_pos.saturating_sub(LOOKBACK_SIZE));
+            let safe = std::cmp::min(self.reader_pos, self.out_pos.saturating_sub(LOOKBACK_SIZE));
 
             // Move everything to the left.
             self.out_buffer.copy_within(safe..self.out_pos, 0);
