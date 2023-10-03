@@ -5,6 +5,15 @@ use fdeflate::Decompressor;
 /// How far back inflate may need to look.
 const LOOKBACK_SIZE: usize = 32 * 1024;
 
+/// Limit of how much will be inflated in one call to `fdeflate`.
+const INCREMENTAL_INFLATE_OUTPUT_SIZE: usize = 4096;
+
+/// Size of `ZlibStream::out_buffer`.
+///
+/// Big size => `prepare_vec_for_appending` can compact less frequently, which means less
+/// L1 cache trashing.
+const OUT_BUFFER_SIZE: usize = 1024 * 1024;
+
 /// Ergonomics wrapper around `miniz_oxide::inflate::stream` for zlib compressed data.
 pub(super) struct ZlibStream {
     /// Current decoding state.
@@ -50,7 +59,7 @@ impl ZlibStream {
             started: false,
             in_buffer: Vec::with_capacity(CHUNCK_BUFFER_SIZE),
             in_pos: 0,
-            out_buffer: vec![0; LOOKBACK_SIZE + CHUNCK_BUFFER_SIZE],
+            out_buffer: Vec::with_capacity(OUT_BUFFER_SIZE),
             reader_pos: 0,
             out_pos: 0,
             ignore_adler32: true,
@@ -127,7 +136,6 @@ impl ZlibStream {
 
         self.started = true;
         self.out_pos += out_consumed;
-        self.compact_out_buffer_if_needed();
 
         Ok(in_consumed)
     }
@@ -169,51 +177,57 @@ impl ZlibStream {
                     }
                     .into(),
                 ));
-            } else {
-                self.compact_out_buffer_if_needed();
             }
         }
     }
 
-    /// Resize the vector to allow allocation of more data.
+    /// Ensure that there are at least `INFLATE_INCREMENTAL_OUTPUT_SIZE` bytes in
+    /// `self.out_buffer[self.out_pos..]`.
     fn prepare_vec_for_appending(&mut self) {
-        if self.out_buffer.len().saturating_sub(self.out_pos) >= CHUNCK_BUFFER_SIZE {
+        let mut target_len = self.out_pos.saturating_add(INCREMENTAL_INFLATE_OUTPUT_SIZE);
+        if target_len <= self.out_buffer.len() {
             return;
         }
 
-        let buffered_len = self.decoding_size(self.out_buffer.len());
-        debug_assert!(self.out_buffer.len() <= buffered_len);
-        self.out_buffer.resize(buffered_len, 0u8);
-    }
+        // Compact `self.out_buffer` if needed.
+        //
+        // The `Vec::resize` call below may require a bigger buffer than the vector's current
+        // capacity.  Copying all of `Vec`'s data into the new, bigger buffer would result in
+        // undesirable trashing of L1 cache.  Therefore we try to avoid this by compacting
+        // `self.out_buffer` instead.
+        //
+        // Compacting the buffer moves `self.out_buffer[safe..self.out_pos` bytes to the beginning
+        // of the buffer (discarding the bytes in `self.out_buffer[..safe]`).  This shortens the
+        // current buffer and should avoid the need to grow/reallocate `Vec`'s buffer.  Compacting
+        // still has to copy *some* bytes, but typically `self.out_pos - self.safe_pos` is much
+        // smaller than `out_buffer.len()`.  Compacting also requires re-zeroing bytes in
+        // `self.out_buffer[self.out_pos..], but again the cost is smaller than the cost of growing
+        // the `Vec` (one factor is that `memset` is cheaper than `memcpy`).
+        //
+        // Still, compacting has non-zero cost (it will also trash L1 cache, because it has to at
+        // least move 32kB / `LOOKBACK_SIZE` bytes), so we try to do it infrequently by using
+        // `self.out_buffer` with a huge capacity (see `OUT_BUFFER_SIZE`).
+        if target_len > self.out_buffer.capacity() {
+            // Only discard "safe" bytes: ones that have already been read and are not needed for
+            // inflate algorithm look-back.
+            let safe =
+                std::cmp::min(self.reader_pos, self.out_pos.saturating_sub(LOOKBACK_SIZE));
 
-    fn decoding_size(&self, len: usize) -> usize {
-        // Allocate one more chunk size than currently or double the length while ensuring that the
-        // allocation is valid and that any cursor within it will be valid.
-        len
-            // This keeps the buffer size a power-of-two, required by miniz_oxide.
-            .saturating_add(CHUNCK_BUFFER_SIZE.max(len))
-            // Ensure all buffer indices are valid cursor positions.
-            // Note: both cut off and zero extension give correct results.
-            .min(u64::max_value() as usize)
-            // Ensure the allocation request is valid.
-            // TODO: maximum allocation limits?
-            .min(isize::max_value() as usize)
-    }
-
-    // TODO: Compacting the `out_buffer` effectively flushes out the L1 cache which seems
-    // undesirable.  Consider avoiding this somehow:
-    // * Compact less often?
-    // * Use a cicrular ring buffer (requires tweaks to `fdeflate`)?
-    fn compact_out_buffer_if_needed(&mut self) {
-        let safe = std::cmp::min(self.reader_pos, self.out_pos.saturating_sub(LOOKBACK_SIZE));
-        if safe != 0 {
-            // Compact `out_buffer` by shifting all the non-discardable byte to the left (i.e. to
-            // position 0).
+            // Move everything to the left.
             self.out_buffer.copy_within(safe..self.out_pos, 0);
             self.out_pos -= safe;
             self.reader_pos -= safe;
+            target_len -= safe;
+
+            // `truncate` helps to ensure that `resize` below will zero-out bytes beyond `out_pos`.
             self.out_buffer.truncate(self.out_pos);
         }
+
+        self.out_buffer.resize(target_len, 0);
+
+        // To be L1-cache-friendly we shouldn't grow/reallocate `out_buffer` - it should stay at
+        // the same capacity throughout its lifetime.
+        debug_assert_eq!(OUT_BUFFER_SIZE, self.out_buffer.capacity());
     }
 
     /// Returns the decompressed output.  This is an alternative to `self.read_to_end` that doesn't
