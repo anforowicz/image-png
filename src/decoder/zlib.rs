@@ -106,38 +106,59 @@ impl ZlibStream {
             self.state.ignore_adler32();
         }
 
-        let in_data = if self.in_buffer.is_empty() {
-            data
-        } else {
+        let using_in_buffer = !self.in_buffer.is_empty();
+        let in_data = if using_in_buffer {
+            debug_assert!(self.in_pos < self.in_buffer.len());
             &self.in_buffer[self.in_pos..]
+        } else {
+            data
         };
 
-        let (mut in_consumed, out_consumed) = self
+        let (in_consumed, out_consumed) = self
             .state
             .read(in_data, self.out_buffer.as_mut_slice(), self.out_pos, false)
             .map_err(|err| {
                 DecodingError::Format(FormatErrorInner::CorruptFlateStream { err }.into())
             })?;
-
-        if !self.in_buffer.is_empty() {
-            self.in_pos += in_consumed;
-            in_consumed = 0;
-        }
-
-        if self.in_buffer.len() == self.in_pos {
-            self.in_buffer.clear();
-            self.in_pos = 0;
-        }
-
-        if in_consumed == 0 {
-            self.in_buffer.extend_from_slice(data);
-            in_consumed = data.len();
-        }
-
         self.started = true;
         self.out_pos += out_consumed;
+        if using_in_buffer {
+            self.in_pos += in_consumed;
+            debug_assert!(self.in_pos <= self.in_buffer.len());
+            if self.in_pos == self.in_buffer.len() {
+                self.in_buffer.clear();
+                self.in_pos = 0;
+            }
+        }
 
-        Ok(in_consumed)
+        let made_progress = in_consumed != 0 || out_consumed != 0;
+        let data_consumed = if made_progress {
+            if using_in_buffer {
+                0
+            } else {
+                in_consumed
+            }
+        } else {
+            // Compact `in_buffer` before extending it.
+            if !self.in_buffer.is_empty() {
+                let new_in_buffer_len = self.in_buffer.len() - self.in_pos;
+                self.in_buffer.copy_within(self.in_pos.., 0);
+                self.in_buffer.truncate(new_in_buffer_len);
+                self.in_pos = 0;
+            }
+
+            // Append all or part of `data` to `in_buffer`.
+            let in_buffer_space_left = self.in_buffer.capacity() - self.in_buffer.len();
+            let data_consumed = std::cmp::min(in_buffer_space_left, data.len());
+            self.in_buffer.extend_from_slice(&data[..data_consumed]);
+
+            // Double-check that `in_buffer` doesn't grow - out L1-cache-friendliness depends on it
+            debug_assert_eq!(self.in_buffer.capacity(), CHUNCK_BUFFER_SIZE);
+
+            data_consumed
+        };
+        debug_assert!(data_consumed <= data.len());
+        Ok(data_consumed)
     }
 
     /// Called after all consecutive IDAT chunks were handled.
