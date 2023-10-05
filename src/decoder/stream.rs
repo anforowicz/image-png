@@ -51,9 +51,13 @@ enum State {
     U32Byte2(U32ValueKind, u32),
     U32Byte1(U32ValueKind, u32),
     U32(U32ValueKind),
-    ReadChunk(ChunkType),
-    PartialChunk(ChunkType),
-    DecodeData(ChunkType, usize),
+    /// Reading chunk data from external input, and appending it to `ChunkState::raw_bytes`.
+    ReadChunkData(ChunkType),
+    /// Checks if all chunk data has been already read into `ChunkState::raw_bytes` and if so
+    /// the parses the chunk.  Otherwise, goes back to ReadChunkData state.
+    ParseChunkData(ChunkType),
+    /// Reading image data and feeding it directly into `StreamingDecoder::inflater`.
+    ImageData(ChunkType),
 }
 
 #[derive(Debug)]
@@ -429,6 +433,8 @@ pub struct StreamingDecoder {
     pub(crate) info: Option<Info<'static>>,
     /// The animation chunk sequence number.
     current_seq_no: Option<u32>,
+    /// Whether we have already seen a start of an IDAT chunk.  (Used to validate chunk ordering -
+    /// some chunk types can only appear before or after an IDAT chunk.)
     have_idat: bool,
     decode_options: DecodeOptions,
 }
@@ -592,7 +598,11 @@ impl StreamingDecoder {
                         self.current_chunk.raw_bytes.clear();
                         self.state = match type_str {
                             chunk::fdAT => Some(U32(ApngSequenceNumber)),
-                            _ => Some(ReadChunk(type_str)),
+                            IDAT => {
+                                self.have_idat = true;
+                                Some(ImageData(type_str))
+                            }
+                            _ => Some(ReadChunkData(type_str)),
                         };
                         Ok((1, Decoded::ChunkBegin(length, type_str)))
                     }
@@ -651,7 +661,7 @@ impl StreamingDecoder {
                             self.current_chunk.crc.update(&data);
                         }
 
-                        self.state = Some(ReadChunk(chunk::fdAT));
+                        self.state = Some(ImageData(chunk::fdAT));
                         Ok((1, Decoded::PartialChunk(chunk::fdAT)))
                     }
                 }
@@ -668,36 +678,22 @@ impl StreamingDecoder {
                 self.state = Some(U32Byte1(type_, u32::from(current_byte) << 24));
                 Ok((1, Decoded::Nothing))
             }
-            PartialChunk(type_str) => {
-                match type_str {
-                    IDAT => {
-                        self.have_idat = true;
-                        self.state = Some(DecodeData(type_str, 0));
-                        Ok((0, Decoded::PartialChunk(type_str)))
-                    }
-                    chunk::fdAT => {
-                        self.state = Some(DecodeData(type_str, 0));
-                        Ok((0, Decoded::PartialChunk(type_str)))
-                    }
-                    // Handle other chunks
-                    _ => {
-                        if self.current_chunk.remaining == 0 {
-                            // complete chunk
-                            Ok((0, self.parse_chunk(type_str)?))
-                        } else {
-                            // Make sure we have room to read more of the chunk.
-                            // We need it fully before parsing.
-                            self.reserve_current_chunk()?;
+            ParseChunkData(type_str) => {
+                debug_assert!(type_str != IDAT && type_str != chunk::fdAT);
+                if self.current_chunk.remaining == 0 {
+                    // Got complete chunk.
+                    Ok((0, self.parse_chunk(type_str)?))
+                } else {
+                    // Make sure we have room to read more of the chunk.
+                    // We need it fully before parsing.
+                    self.reserve_current_chunk()?;
 
-                            self.state = Some(ReadChunk(type_str));
-                            Ok((0, Decoded::PartialChunk(type_str)))
-                        }
-                    }
+                    self.state = Some(ReadChunkData(type_str));
+                    Ok((0, Decoded::PartialChunk(type_str)))
                 }
             }
-            ReadChunk(type_str) => {
-                // The _previous_ event wanted to return the contents of raw_bytes, and let the
-                // caller consume it,
+            ReadChunkData(type_str) => {
+                debug_assert!(type_str != IDAT && type_str != chunk::fdAT);
                 if self.current_chunk.remaining == 0 {
                     self.state = Some(U32(U32ValueKind::Crc(type_str)));
                     Ok((0, Decoded::Nothing))
@@ -713,7 +709,7 @@ impl StreamingDecoder {
                     let bytes_avail = min(buf.len(), buf_avail);
                     let n = min(*remaining, bytes_avail as u32);
                     if buf_avail == 0 {
-                        self.state = Some(PartialChunk(type_str));
+                        self.state = Some(ParseChunkData(type_str));
                         Ok((0, Decoded::Nothing))
                     } else {
                         let buf = &buf[..n as usize];
@@ -724,27 +720,27 @@ impl StreamingDecoder {
 
                         *remaining -= n;
                         if *remaining == 0 {
-                            self.state = Some(PartialChunk(type_str));
+                            self.state = Some(ParseChunkData(type_str));
                         } else {
-                            self.state = Some(ReadChunk(type_str));
+                            self.state = Some(ReadChunkData(type_str));
                         }
                         Ok((n as usize, Decoded::Nothing))
                     }
                 }
             }
-            DecodeData(type_str, mut n) => {
-                let chunk_len = self.current_chunk.raw_bytes.len();
-                let chunk_data = &self.current_chunk.raw_bytes[n..];
-                let c = self.inflater.decompress(chunk_data)?;
-                n += c;
-                if n == chunk_len && c == 0 {
-                    self.current_chunk.raw_bytes.clear();
-                    self.state = Some(ReadChunk(type_str));
-                    Ok((0, Decoded::ImageData))
+            ImageData(type_str) => {
+                debug_assert!(type_str == IDAT || type_str == chunk::fdAT);
+                let len = std::cmp::min(buf.len(), self.current_chunk.remaining as usize);
+                let buf = &buf[..len];
+                let consumed = self.inflater.decompress(buf)?;
+                self.current_chunk.crc.update(&buf[..consumed]);
+                self.current_chunk.remaining -= consumed as u32;
+                if self.current_chunk.remaining == 0 {
+                    self.state = Some(U32(U32ValueKind::Crc(type_str)));
                 } else {
-                    self.state = Some(DecodeData(type_str, n));
-                    Ok((0, Decoded::ImageData))
+                    self.state = Some(ImageData(type_str));
                 }
+                Ok((consumed, Decoded::ImageData))
             }
         }
     }

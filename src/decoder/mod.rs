@@ -717,16 +717,16 @@ impl<R: Read> Reader<R> {
         {
             let mut cursor = self.curr_row.as_mut_slice();
             while !cursor.is_empty() {
-                if self.subframe.consumed_and_flushed {
-                    return Err(DecodingError::Format(
-                        FormatErrorInner::NoMoreImageData.into(),
-                    ));
-                }
-
                 let new_bytes = self.decoder.decoder.image_data_reader().read(cursor)?;
                 cursor = &mut cursor[new_bytes..];
 
                 if new_bytes == 0 {
+                    if self.subframe.consumed_and_flushed {
+                        return Err(DecodingError::Format(
+                            FormatErrorInner::NoMoreImageData.into(),
+                        ));
+                    }
+
                     match self.decoder.decode_next()? {
                         Some(Decoded::ImageData) => {}
                         Some(Decoded::ImageDataFlushed) => {
