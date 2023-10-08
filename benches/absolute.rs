@@ -63,9 +63,9 @@ fn main() {
         );
         stdout().flush().unwrap();
         let start = Instant::now();
-        for _ in 0..test.repetitions {
-            bench_file_once(test.data);
-        }
+        //for _ in 0..test.repetitions {
+        bench_file_once(test.data);
+        //}
         println!(" done in {}ms.", start.elapsed().as_millis());
     }
 }

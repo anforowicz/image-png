@@ -291,9 +291,27 @@ impl ZlibStream {
 
 impl std::io::Read for ZlibStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        static mut N_COUNT: usize = 0;
+        static mut MISS_COUNT: usize = 0;
+        super::cache_counters::start();
+
         let n = std::cmp::min(buf.len(), self.out_pos - self.reader_pos);
         buf[0..n].copy_from_slice(&self.out_buffer[self.reader_pos..self.reader_pos + n]);
         self.reader_pos += n;
+
+        let (n_count, miss_count): (usize, usize) = {
+            let cache_misses = super::cache_counters::stop();
+            unsafe {
+                N_COUNT += n;
+                MISS_COUNT += cache_misses as usize;
+                (N_COUNT, MISS_COUNT)
+            }
+        };
+        println!(
+            "miss_count={miss_count}, n_count={n_count}, n/miss={}",
+            n_count / miss_count
+        );
+
         Ok(n)
     }
 }

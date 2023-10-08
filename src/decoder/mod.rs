@@ -1,3 +1,4 @@
+pub(crate) mod cache_counters;
 mod stream;
 mod zlib;
 
