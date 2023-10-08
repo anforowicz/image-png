@@ -1358,11 +1358,12 @@ mod tests {
     use super::ScaledFloat;
     use super::SourceChromaticities;
     use std::fs::File;
+    use std::io::BufReader;
 
     #[test]
     fn image_gamma() -> Result<(), ()> {
         fn trial(path: &str, expected: Option<ScaledFloat>) {
-            let decoder = crate::Decoder::new(File::open(path).unwrap());
+            let decoder = crate::Decoder::new(BufReader::new(File::open(path).unwrap()));
             let reader = decoder.read_info().unwrap();
             let actual: Option<ScaledFloat> = reader.info().source_gamma;
             assert!(actual == expected);
@@ -1403,7 +1404,7 @@ mod tests {
     #[test]
     fn image_source_chromaticities() -> Result<(), ()> {
         fn trial(path: &str, expected: Option<SourceChromaticities>) {
-            let decoder = crate::Decoder::new(File::open(path).unwrap());
+            let decoder = crate::Decoder::new(BufReader::new(File::open(path).unwrap()));
             let reader = decoder.read_info().unwrap();
             let actual: Option<SourceChromaticities> = reader.info().source_chromaticities;
             assert!(actual == expected);
@@ -1595,7 +1596,9 @@ mod tests {
         // https://github.com/image-rs/image/issues/1825#issuecomment-1321798639,
         // but the 2nd iCCP chunk has been altered manually (see the 2nd comment below for more
         // details).
-        let decoder = crate::Decoder::new(File::open("tests/bugfixes/issue#1825.png").unwrap());
+        let decoder = crate::Decoder::new(BufReader::new(
+            File::open("tests/bugfixes/issue#1825.png").unwrap(),
+        ));
         let reader = decoder.read_info().unwrap();
         let icc_profile = reader.info().icc_profile.clone().unwrap().into_owned();
 

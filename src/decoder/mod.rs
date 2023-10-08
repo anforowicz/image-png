@@ -1,10 +1,10 @@
 mod stream;
 mod zlib;
 
+use self::stream::FormatErrorInner;
 pub use self::stream::{DecodeOptions, Decoded, DecodingError, StreamingDecoder};
-use self::stream::{FormatErrorInner, CHUNCK_BUFFER_SIZE};
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, Read};
 use std::mem;
 use std::ops::Range;
 
@@ -68,7 +68,7 @@ impl Default for Limits {
 }
 
 /// PNG Decoder
-pub struct Decoder<R: Read> {
+pub struct Decoder<R: BufRead> {
     read_decoder: ReadDecoder<R>,
     /// Output transformations
     transform: Transformations,
@@ -124,17 +124,17 @@ impl<'data> Row<'data> {
     }
 }
 
-impl<R: Read> Decoder<R> {
+impl<R: BufRead> Decoder<R> {
     /// Create a new decoder configuration with default limits.
     pub fn new(r: R) -> Decoder<R> {
         Decoder::new_with_limits(r, Limits::default())
     }
 
     /// Create a new decoder configuration with custom limits.
-    pub fn new_with_limits(r: R, limits: Limits) -> Decoder<R> {
+    pub fn new_with_limits(reader: R, limits: Limits) -> Decoder<R> {
         Decoder {
             read_decoder: ReadDecoder {
-                reader: BufReader::with_capacity(CHUNCK_BUFFER_SIZE, r),
+                reader,
                 decoder: StreamingDecoder::new(),
                 at_eof: false,
             },
@@ -144,10 +144,10 @@ impl<R: Read> Decoder<R> {
     }
 
     /// Create a new decoder configuration with custom `DecodeOptions`.
-    pub fn new_with_options(r: R, decode_options: DecodeOptions) -> Decoder<R> {
+    pub fn new_with_options(reader: R, decode_options: DecodeOptions) -> Decoder<R> {
         Decoder {
             read_decoder: ReadDecoder {
-                reader: BufReader::with_capacity(CHUNCK_BUFFER_SIZE, r),
+                reader,
                 decoder: StreamingDecoder::new_with_options(decode_options),
                 at_eof: false,
             },
@@ -166,17 +166,20 @@ impl<R: Read> Decoder<R> {
     ///
     /// ```
     /// use std::fs::File;
+    /// use std::io::BufReader;
     /// use png::{Decoder, Limits};
     /// // This image is 32×32, 1bit per pixel. The reader buffers one row which requires 4 bytes.
     /// let mut limits = Limits::default();
     /// limits.bytes = 3;
-    /// let mut decoder = Decoder::new_with_limits(File::open("tests/pngsuite/basi0g01.png").unwrap(), limits);
+    /// let file_reader = BufReader::new(File::open("tests/pngsuite/basi0g01.png").unwrap());
+    /// let mut decoder = Decoder::new_with_limits(file_reader, limits);
     /// assert!(decoder.read_info().is_err());
     ///
     /// // This image is 32x32 pixels, so the decoder will allocate less than 10Kib
     /// let mut limits = Limits::default();
     /// limits.bytes = 10*1024;
-    /// let mut decoder = Decoder::new_with_limits(File::open("tests/pngsuite/basi0g01.png").unwrap(), limits);
+    /// let file_reader = BufReader::new(File::open("tests/pngsuite/basi0g01.png").unwrap());
+    /// let mut decoder = Decoder::new_with_limits(file_reader, limits);
     /// assert!(decoder.read_info().is_ok());
     /// ```
     pub fn set_limits(&mut self, limits: Limits) {
@@ -250,8 +253,10 @@ impl<R: Read> Decoder<R> {
     /// eg.
     /// ```
     /// use std::fs::File;
+    /// use std::io::BufReader;
     /// use png::Decoder;
-    /// let mut decoder = Decoder::new(File::open("tests/pngsuite/basi0g01.png").unwrap());
+    /// let file_reader = BufReader::new(File::open("tests/pngsuite/basi0g01.png").unwrap());
+    /// let mut decoder = Decoder::new(file_reader);
     /// decoder.set_ignore_text_chunk(true);
     /// assert!(decoder.read_info().is_ok());
     /// ```
@@ -271,13 +276,13 @@ impl<R: Read> Decoder<R> {
     }
 }
 
-struct ReadDecoder<R: Read> {
-    reader: BufReader<R>,
+struct ReadDecoder<R: BufRead> {
+    reader: R,
     decoder: StreamingDecoder,
     at_eof: bool,
 }
 
-impl<R: Read> ReadDecoder<R> {
+impl<R: BufRead> ReadDecoder<R> {
     /// Returns the next decoded chunk. If the chunk is an ImageData chunk, its contents can later
     /// be retrieved via `image_data_reader`.
     fn decode_next(&mut self) -> Result<Option<Decoded>, DecodingError> {
@@ -335,7 +340,7 @@ impl<R: Read> ReadDecoder<R> {
 /// PNG reader (mostly high-level interface)
 ///
 /// Provides a high level that iterates over lines or whole images.
-pub struct Reader<R: Read> {
+pub struct Reader<R: BufRead> {
     decoder: ReadDecoder<R>,
     bpp: BytesPerPixel,
     subframe: SubframeInfo,
@@ -391,7 +396,7 @@ enum SubframeIdx {
     End,
 }
 
-impl<R: Read> Reader<R> {
+impl<R: BufRead> Reader<R> {
     /// Reads all meta data until the next frame data starts.
     /// Requires IHDR before the IDAT and fcTL before fdAT.
     fn read_until_image_data(&mut self) -> Result<(), DecodingError> {
