@@ -43,8 +43,9 @@ const TESTS: [Test; 6] = [
     },
     Test {
         name: "Lohengrin_-_Illustrated_Sporting_and_Dramatic_News.png",
-        data:include_bytes!(
-            "../tests/benches/Lohengrin_-_Illustrated_Sporting_and_Dramatic_News.png"),
+        data: include_bytes!(
+            "../tests/benches/Lohengrin_-_Illustrated_Sporting_and_Dramatic_News.png"
+        ),
         repetitions: 70,
     },
     Test {
@@ -56,7 +57,10 @@ const TESTS: [Test; 6] = [
 
 fn main() {
     for test in TESTS.iter() {
-        print!("Starting {} repetitions of decoding {} ...", test.repetitions, test.name);
+        print!(
+            "Starting {} repetitions of decoding {} ...",
+            test.repetitions, test.name
+        );
         stdout().flush().unwrap();
         let start = Instant::now();
         for _ in 0..test.repetitions {

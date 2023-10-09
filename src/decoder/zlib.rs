@@ -1,16 +1,19 @@
-use super::{stream::FormatErrorInner, DecodingError, CHUNCK_BUFFER_SIZE};
+use super::{stream::FormatErrorInner, DecodingError};
 
 use fdeflate::Decompressor;
 
 /// How far back inflate may need to look.
 const LOOKBACK_SIZE: usize = 32 * 1024;
 
-/// Limit of how much will be inflated in one call to `fdeflate`.
-const INCREMENTAL_INFLATE_OUTPUT_SIZE: usize = 4096;
-
-/// Size of `ZlibStream::out_buffer`.
+/// Capacity of `ZlibStream::in_buffer`.
 ///
-/// Big size => `prepare_vec_for_appending` can compact less frequently, which means less
+/// This buffer should be needed fairly infrequently (only when `fdeflate` can't make progress due
+/// to insufficient input - typically when crossing from one IDAT chunk to another).
+const IN_BUFFER_SIZE: usize = 1024;
+
+/// Capacity of `ZlibStream::out_buffer`.
+///
+/// Big capacity => `prepare_vec_for_appending` can compact less frequently, which means less
 /// L1 cache trashing.
 const OUT_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -50,6 +53,8 @@ pub(super) struct ZlibStream {
     ///
     /// This flag should not be modified after decompression has started.
     ignore_adler32: bool,
+    /// How many bytes we predict our client, reader will need next.
+    predicted_read_size: usize,
 }
 
 impl ZlibStream {
@@ -57,16 +62,17 @@ impl ZlibStream {
         ZlibStream {
             state: Box::new(Decompressor::new()),
             started: false,
-            in_buffer: Vec::with_capacity(CHUNCK_BUFFER_SIZE),
+            in_buffer: Vec::with_capacity(IN_BUFFER_SIZE),
             in_pos: 0,
             out_buffer: Vec::with_capacity(OUT_BUFFER_SIZE),
             reader_pos: 0,
             out_pos: 0,
             ignore_adler32: true,
+            predicted_read_size: 4096,
         }
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self, rowlen: usize) {
         self.started = false;
         self.in_buffer.clear();
         self.in_pos = 0;
@@ -74,6 +80,16 @@ impl ZlibStream {
         self.reader_pos = 0;
         self.out_pos = 0;
         *self.state = Decompressor::new();
+
+        // In an attempt to fit our whole working set into L1 cache, we try to decompress only as
+        // much as needed to unfilter the next row of PNG data.  OTOH, for small `rowlen` this
+        // might be excessively small, so we use a lower bound of 1024 bytes.
+        //
+        // We predict a slightly larger read size (by 8 bytes), because sometimes `fdeflate` cannot
+        // decompress *exactly* the required number of bytes.
+        //
+        // Note that initial rows in interlaced images will be smaller, but this is okay.
+        self.predicted_read_size = std::cmp::max(1024, rowlen + 8);
     }
 
     /// Set the `ignore_adler32` flag and return `true` if the flag was
@@ -153,7 +169,7 @@ impl ZlibStream {
             self.in_buffer.extend_from_slice(&data[..data_consumed]);
 
             // Double-check that `in_buffer` doesn't grow - out L1-cache-friendliness depends on it
-            debug_assert_eq!(self.in_buffer.capacity(), CHUNCK_BUFFER_SIZE);
+            debug_assert_eq!(self.in_buffer.capacity(), IN_BUFFER_SIZE);
 
             data_consumed
         };
@@ -202,10 +218,13 @@ impl ZlibStream {
         }
     }
 
-    /// Ensure that there are at least `INFLATE_INCREMENTAL_OUTPUT_SIZE` bytes in
+    /// Ensure that there are at least `self.predicted_read_size` bytes in
     /// `self.out_buffer[self.out_pos..]`.
     fn prepare_vec_for_appending(&mut self) {
-        let mut target_len = self.out_pos.saturating_add(INCREMENTAL_INFLATE_OUTPUT_SIZE);
+        let mut target_len = std::cmp::max(
+            self.reader_pos.saturating_add(self.predicted_read_size),
+            self.out_pos + 2, // Minimum room required by `fdeflate`.
+        );
         if target_len <= self.out_buffer.len() {
             return;
         }

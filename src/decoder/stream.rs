@@ -483,7 +483,8 @@ impl StreamingDecoder {
         self.current_chunk.crc = Crc32::new();
         self.current_chunk.remaining = 0;
         self.current_chunk.raw_bytes.clear();
-        self.inflater.reset();
+        let tentative_rowlen = 4096;
+        self.inflater.reset(tentative_rowlen);
         self.info = None;
         self.current_seq_no = None;
         self.have_idat = false;
@@ -821,7 +822,6 @@ impl StreamingDecoder {
             }
             0
         });
-        self.inflater.reset();
         let fc = FrameControl {
             sequence_number: next_seq_no,
             width: buf.read_be()?,
@@ -855,6 +855,8 @@ impl StreamingDecoder {
         };
         self.info.as_ref().unwrap().validate(&fc)?;
         self.info.as_mut().unwrap().frame_control = Some(fc);
+        self.inflater
+            .reset(self.info.as_ref().unwrap().raw_row_length());
         Ok(Decoded::FrameControl(fc))
     }
 
@@ -1136,7 +1138,6 @@ impl StreamingDecoder {
     }
 
     fn parse_ihdr(&mut self) -> Result<Decoded, DecodingError> {
-        self.inflater.reset();
         if self.info.is_some() {
             return Err(DecodingError::Format(
                 FormatErrorInner::DuplicateChunk { kind: IHDR }.into(),
@@ -1211,6 +1212,8 @@ impl StreamingDecoder {
             interlaced,
             ..Default::default()
         });
+        self.inflater
+            .reset(self.info.as_ref().unwrap().raw_row_length());
 
         Ok(Decoded::Header(
             width, height, bit_depth, color_type, interlaced,
