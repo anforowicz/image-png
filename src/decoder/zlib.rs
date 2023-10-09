@@ -1,6 +1,6 @@
 use super::{stream::FormatErrorInner, DecodingError};
-
-use fdeflate::Decompressor;
+use miniz_oxide::inflate::TINFLStatus;
+use miniz_oxide::inflate::core::{DecompressorOxide, inflate_flags};
 
 /// How far back inflate may need to look.
 const LOOKBACK_SIZE: usize = 32 * 1024;
@@ -20,7 +20,7 @@ const OUT_BUFFER_SIZE: usize = 1024 * 1024;
 /// Ergonomics wrapper around `miniz_oxide::inflate::stream` for zlib compressed data.
 pub(super) struct ZlibStream {
     /// Current decoding state.
-    state: Box<fdeflate::Decompressor>,
+    state: Box<DecompressorOxide>,
     /// If there has been a call to decompress already.
     started: bool,
     /// A buffer of compressed data.
@@ -60,7 +60,7 @@ pub(super) struct ZlibStream {
 impl ZlibStream {
     pub(crate) fn new() -> Self {
         ZlibStream {
-            state: Box::new(Decompressor::new()),
+            state: Box::new(DecompressorOxide::new()),
             started: false,
             in_buffer: Vec::with_capacity(IN_BUFFER_SIZE),
             in_pos: 0,
@@ -79,14 +79,15 @@ impl ZlibStream {
         self.out_buffer.clear();
         self.reader_pos = 0;
         self.out_pos = 0;
-        *self.state = Decompressor::new();
+        *self.state = DecompressorOxide::new();
 
         // In an attempt to fit our whole working set into L1 cache, we try to decompress only as
         // much as needed to unfilter the next row of PNG data.  OTOH, for small `rowlen` this
         // might be excessively small, so we use a lower bound of 1024 bytes.
         //
-        // We predict a slightly larger read size (by 8 bytes), because sometimes `fdeflate` cannot
-        // decompress *exactly* the required number of bytes.
+        // We predict a slightly larger read size (by 8 bytes), because some decompression crates
+        // (e.g. `fdeflate`) are not always able to decompress *exactly* the required number of
+        // bytes.
         //
         // Note that initial rows in interlaced images will be smaller, but this is okay.
         self.predicted_read_size = std::cmp::max(1024, rowlen + 8);
@@ -118,10 +119,6 @@ impl ZlibStream {
     pub(crate) fn decompress(&mut self, data: &[u8]) -> Result<usize, DecodingError> {
         self.prepare_vec_for_appending();
 
-        if !self.started && self.ignore_adler32 {
-            self.state.ignore_adler32();
-        }
-
         let using_in_buffer = !self.in_buffer.is_empty();
         let in_data = if using_in_buffer {
             debug_assert!(self.in_pos < self.in_buffer.len());
@@ -130,12 +127,20 @@ impl ZlibStream {
             data
         };
 
-        let (in_consumed, out_consumed) = self
-            .state
-            .read(in_data, self.out_buffer.as_mut_slice(), self.out_pos, false)
-            .map_err(|err| {
-                DecodingError::Format(FormatErrorInner::CorruptFlateStream { err }.into())
-            })?;
+        let (_status, in_consumed, out_consumed) = miniz_oxide::inflate::core::decompress(
+            &mut self.state,
+            in_data,
+            self.out_buffer.as_mut_slice(),
+            self.out_pos,
+            inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF |
+            inflate_flags::TINFL_FLAG_HAS_MORE_INPUT |
+            inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER |
+            inflate_flags::TINFL_FLAG_IGNORE_ADLER32 // DO NOT SUBMIT?,
+        );
+        // TODO / DO NOT SUBMIT - map `status`
+        //    .map_err(|err| {
+        //        DecodingError::Format(FormatErrorInner::CorruptFlateStream { err }.into())
+        //    })?;
         self.started = true;
         self.out_pos += out_consumed;
         if using_in_buffer {
@@ -190,22 +195,24 @@ impl ZlibStream {
         loop {
             self.prepare_vec_for_appending();
 
-            let (in_consumed, out_consumed) = self
-                .state
-                .read(
-                    &self.in_buffer[self.in_pos..],
-                    self.out_buffer.as_mut_slice(),
-                    self.out_pos,
-                    true,
-                )
-                .map_err(|err| {
-                    DecodingError::Format(FormatErrorInner::CorruptFlateStream { err }.into())
-                })?;
+            let (status, in_consumed, out_consumed) = miniz_oxide::inflate::core::decompress(
+                &mut self.state,
+                &self.in_buffer[self.in_pos..],
+                self.out_buffer.as_mut_slice(),
+                self.out_pos,
+                inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF |
+                inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER |
+                inflate_flags::TINFL_FLAG_IGNORE_ADLER32 // DO NOT SUBMIT?,
+            );
+            // TODO / DO NOT SUBMIT - handle `status`
+            //        .map_err(|err| {
+            //            DecodingError::Format(FormatErrorInner::CorruptFlateStream { err }.into())
+            //        })?;
 
             self.in_pos += in_consumed;
             self.out_pos += out_consumed;
 
-            if self.state.is_done() {
+            if status == TINFLStatus::Done {
                 return Ok(());
             } else if in_consumed == 0 && out_consumed == 0 {
                 return Err(DecodingError::Format(
