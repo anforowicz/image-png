@@ -95,26 +95,49 @@ where
     }
 }
 
+fn render_image_into_crc32(input: impl BufRead) -> Result<u32, png::DecodingError> {
+    let mut decoder = png::Decoder::new(input);
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info()?;
+    let mut img_data = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut img_data)?;
+    // First sanity check:
+    assert_eq!(
+        img_data.len(),
+        info.width as usize
+            * info.height as usize
+            * info.color_type.samples()
+            * info.bit_depth as usize
+            / 8
+    );
+    let mut crc = Crc32::new();
+    crc.update(&img_data);
+    Ok(crc.finalize())
+}
+
 #[test]
 fn render_images() {
     process_images("results.txt", &TEST_SUITES, |path| {
-        let mut decoder = png::Decoder::new(BufReader::new(File::open(path)?));
-        decoder.set_transformations(png::Transformations::normalize_to_color8());
-        let mut reader = decoder.read_info()?;
-        let mut img_data = vec![0; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut img_data)?;
-        // First sanity check:
-        assert_eq!(
-            img_data.len(),
-            info.width as usize
-                * info.height as usize
-                * info.color_type.samples()
-                * info.bit_depth as usize
-                / 8
-        );
-        let mut crc = Crc32::new();
-        crc.update(&img_data);
-        Ok(crc.finalize())
+        let input = BufReader::new(File::open(path)?);
+        render_image_into_crc32(input)
+    })
+}
+
+/// This test covers that decoding correctly handles the scenarios where the boundary of the input
+/// buffer falls in an unusual or inconvenient place.  Such scenarios rarely happens in practice
+/// (because in practice `BufReader::new` allocates 4kB buffer by default, and when parsing `&[u8]`
+/// there are no boundaries whatsoever).  Nevertheless, the decoder needs to handle them correctly
+/// when they do happen (e.g. the decoder has to handle the case where initially only a part of the
+/// `u32` representing the length of a chunk is present in the input buffer).
+#[test]
+fn render_images_when_reading_byte_by_byte() {
+    process_images("results.txt", &TEST_SUITES, |path| {
+        // Setting the buffer size to 1 byte is a somewhat artificial, but very effective way to
+        // inject a buffer boundary after each of input bytes.
+        const BUFFER_CAPACITY: usize = 1;
+        let input = BufReader::with_capacity(BUFFER_CAPACITY, File::open(path)?);
+
+        render_image_into_crc32(input)
     })
 }
 
