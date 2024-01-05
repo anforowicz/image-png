@@ -1,4 +1,4 @@
-use super::{stream::FormatErrorInner, DecodingError, CHUNCK_BUFFER_SIZE};
+use super::{stream::FormatErrorInner, DecodingError};
 
 use fdeflate::Decompressor;
 
@@ -156,34 +156,29 @@ impl ZlibStream {
             self.max_total_output = usize::MAX;
         }
 
-        let current_len = self.out_buffer.len();
+        // Decompress at most `MAX_INCREMENTAL_DECOMPRESSION_SIZE`.  This helps to ensure that the
+        // decompressed data fits into the L1 cache.  This is set lower than the typical L1 cache
+        // size of 32kB, because we want to account for the fact that the decompressed data will be
+        // copied at least once and to account for memory pressure from other data structures.
+        //
+        // TODO: The size of 16384 bytes is an ad-hoc heuristic.  Consider using a different number.
+        const MAX_INCREMENTAL_DECOMPRESSION_SIZE: usize = 16384;
         let desired_len = self
             .out_pos
-            .saturating_add(CHUNCK_BUFFER_SIZE)
-            .min(self.max_total_output);
-        if current_len >= desired_len {
-            return;
+            .saturating_add(MAX_INCREMENTAL_DECOMPRESSION_SIZE);
+
+        // Allocate at most `self.max_total_output`.  This avoids unnecessarily allocating and
+        // zeroing-out a bigger `out_buffer` than necessary.
+        let desired_len = desired_len.min(self.max_total_output);
+
+        // Ensure the allocation request is valid.
+        // TODO: maximum allocation limits?
+        const _: () = assert!((isize::max_value() as usize) < u64::max_value() as usize);
+        let desired_len = desired_len.min(isize::max_value() as usize);
+
+        if self.out_buffer.len() < desired_len {
+            self.out_buffer.resize(desired_len, 0u8);
         }
-
-        let buffered_len = self.decoding_size(self.out_buffer.len());
-        debug_assert!(self.out_buffer.len() <= buffered_len);
-        self.out_buffer.resize(buffered_len, 0u8);
-    }
-
-    fn decoding_size(&self, len: usize) -> usize {
-        // Allocate one more chunk size than currently or double the length while ensuring that the
-        // allocation is valid and that any cursor within it will be valid.
-        len
-            // This keeps the buffer size a power-of-two, required by miniz_oxide.
-            .saturating_add(CHUNCK_BUFFER_SIZE.max(len))
-            // Ensure all buffer indices are valid cursor positions.
-            // Note: both cut off and zero extension give correct results.
-            .min(u64::max_value() as usize)
-            // Ensure the allocation request is valid.
-            // TODO: maximum allocation limits?
-            .min(isize::max_value() as usize)
-            // Don't unnecessarily allocate more than `max_total_output`.
-            .min(self.max_total_output)
     }
 
     fn transfer_finished_data(&mut self, image_data: &mut Vec<u8>) -> usize {
