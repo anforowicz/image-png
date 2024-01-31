@@ -23,7 +23,16 @@ pub fn create_expansion_into_rgb8(info: &Info) -> TransformFn {
     let rgba_palette = create_rgba_palette(info);
 
     if info.bit_depth == BitDepth::Eight {
-        Box::new(move |input, output, _info| expand_8bit_into_rgb8(input, output, &rgba_palette))
+        Box::new(move |input, output, _info| {
+            #[cfg(feature = "unstable")]
+            {
+                simd::expand_8bit_into_rgb8(input, output, &rgba_palette)
+            }
+            #[cfg(not(feature = "unstable"))]
+            {
+                expand_8bit_into_rgb8(input, output, &rgba_palette)
+            }
+        })
     } else {
         Box::new(move |input, output, info| expand_into_rgb8(input, output, info, &rgba_palette))
     }
@@ -88,6 +97,38 @@ fn create_rgba_palette(info: &Info) -> [[u8; 4]; 256] {
     }
 
     rgba_palette
+}
+
+/// TODO(https://github.com/rust-lang/rust/issues/86656): Stop gating this module behind the
+/// "unstable" feature of the `png` crate.  This should be possible once the "portable_simd"
+/// feature of Rust gets stabilized.
+#[cfg(feature = "unstable")]
+mod simd {
+    use std::simd::num::SimdUint;
+    use std::simd::simd_swizzle;
+    use std::simd::Simd;
+
+    pub fn expand_8bit_into_rgb8(
+        mut input: &[u8],
+        mut output: &mut [u8],
+        rgba_palette: &[[u8; 4]; 256],
+    ) {
+        let u32_palette: &[u32; 256] = bytemuck::cast_ref(rgba_palette);
+
+        while output.len() >= 16 {
+            let indices = Simd::<u8, 4>::from_slice(&input[0..4]);
+            let indices = indices.cast::<usize>();
+            let result = Simd::<u32, 4>::gather_or_default(u32_palette, indices);
+            let result = Simd::<u8, 16>::from_array(bytemuck::cast(result.to_array()));
+            let result =
+                simd_swizzle!(result, [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0, 0, 0, 0]);
+            output[0..16].copy_from_slice(result.as_array());
+
+            input = &input[4..];
+            output = &mut output[12..];
+        }
+        super::expand_8bit_into_rgb8(input, output, rgba_palette);
+    }
 }
 
 fn expand_8bit_into_rgb8(mut input: &[u8], mut output: &mut [u8], rgba_palette: &[[u8; 4]; 256]) {
