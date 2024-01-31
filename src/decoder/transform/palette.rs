@@ -61,6 +61,26 @@ fn create_rgba_palette(info: &Info) -> [[u8; 4]; 256] {
     {
         let mut palette_iter = palette;
         let mut rgba_iter = &mut rgba_palette[..];
+
+        // TODO(https://github.com/rust-lang/rust/issues/86656): Stop gating this module behind the
+        // "unstable" feature of the `png` crate.  This should be possible once the "portable_simd"
+        // feature of Rust gets stabilized.
+        #[cfg(feature = "unstable")]
+        {
+            use std::simd::simd_swizzle;
+            use std::simd::Simd;
+            while palette_iter.len() >= 16 {
+                // Note that `simd_swizzle` uses garbage values for the alpha channel.
+                let simd = Simd::<u8, 16>::from_slice(&palette_iter[0..16]);
+                let simd = simd_swizzle!(simd, [0, 1, 2, 0, 3, 4, 5, 0, 6, 7, 8, 0, 9, 10, 11, 0]);
+                let simd: [[u8; 4]; 4] = bytemuck::cast(simd.to_array());
+                rgba_iter[0..4].copy_from_slice(&simd);
+
+                palette_iter = &palette_iter[12..];
+                rgba_iter = &mut rgba_iter[4..];
+            }
+        }
+
         while palette_iter.len() >= 4 {
             // Copying 4 bytes at a time is more efficient than copying 3.
             // OTOH, this clobbers the alpha value in `rgba_iter[0][3]` - we
