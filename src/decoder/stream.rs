@@ -1833,6 +1833,23 @@ mod tests {
         assert!(decoder.read_info().is_ok());
     }
 
+    /// Tests what happens then [`Reader.finish`] is called twice.
+    #[test]
+    fn test_finishing_twice() {
+        let mut png = Vec::new();
+        write_noncompressed_png(&mut png, 16, 1024);
+        let decoder = Decoder::new(png.as_slice());
+        let mut reader = decoder.read_info().unwrap();
+
+        // First call to `finish` - expecting success.
+        reader.finish().unwrap();
+
+        // Second call to `finish` - expecting an error.
+        let err = reader.finish().unwrap_err();
+        assert!(matches!(&err, DecodingError::Parameter(_)));
+        assert_eq!("End of image has been reached", format!("{err}"));
+    }
+
     /// Writes an acTL chunk.
     /// See https://wiki.mozilla.org/APNG_Specification#.60acTL.60:_The_Animation_Control_Chunk
     fn write_actl(w: &mut impl Write, animation: &crate::AnimationControl) {
