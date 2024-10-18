@@ -1144,14 +1144,23 @@ impl StreamingDecoder {
         // Check if the sbit chunk size is valid.
         if expected != len {
             return Err(DecodingError::Format(
-                FormatErrorInner::InvalidSbitChunkSize { color_type, expected, len }.into(),
+                FormatErrorInner::InvalidSbitChunkSize {
+                    color_type,
+                    expected,
+                    len,
+                }
+                .into(),
             ));
         }
 
         for sbit in &vec {
             if *sbit < 1 || *sbit > bit_depth as u8 {
                 return Err(DecodingError::Format(
-                    FormatErrorInner::InvalidSbit { bit_depth, sbit: *sbit }.into(),
+                    FormatErrorInner::InvalidSbit {
+                        bit_depth,
+                        sbit: *sbit,
+                    }
+                    .into(),
                 ));
             }
         }
@@ -1659,12 +1668,12 @@ mod tests {
     use crate::test_utils::*;
     use crate::{Decoder, DecodingError, Reader};
     use byteorder::WriteBytesExt;
+    use std::borrow::Cow;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::fs::File;
     use std::io::{ErrorKind, Read, Write};
     use std::rc::Rc;
-    use std::borrow::Cow;
 
     #[test]
     fn image_gamma() -> Result<(), ()> {
@@ -1904,10 +1913,22 @@ mod tests {
         }
 
         trial("tests/pngsuite/sbit-g.png", Some(Cow::Owned(vec![5u8])));
-        trial("tests/pngsuite/sbit-ga.png", Some(Cow::Owned(vec![5u8, 3u8])));
-        trial("tests/pngsuite/sbit-indexed.png", Some(Cow::Owned(vec![5u8, 6u8, 5u8])));
-        trial("tests/pngsuite/sbit-rgb.png", Some(Cow::Owned(vec![5u8, 6u8, 5u8])));
-        trial("tests/pngsuite/sbit-rgba.png", Some(Cow::Owned(vec![5u8, 6u8, 5u8, 8u8])));
+        trial(
+            "tests/pngsuite/sbit-ga.png",
+            Some(Cow::Owned(vec![5u8, 3u8])),
+        );
+        trial(
+            "tests/pngsuite/sbit-indexed.png",
+            Some(Cow::Owned(vec![5u8, 6u8, 5u8])),
+        );
+        trial(
+            "tests/pngsuite/sbit-rgb.png",
+            Some(Cow::Owned(vec![5u8, 6u8, 5u8])),
+        );
+        trial(
+            "tests/pngsuite/sbit-rgba.png",
+            Some(Cow::Owned(vec![5u8, 6u8, 5u8, 8u8])),
+        );
         Ok(())
     }
 
