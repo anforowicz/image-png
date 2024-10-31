@@ -65,7 +65,7 @@ impl<R: Read> ReadDecoder<R> {
     /// into `image_data_callback`.
     fn decode_next(
         &mut self,
-        image_data_callback: &mut dyn FnMut(&[u8]),
+        image_data_callback: Option<&mut dyn FnMut(&[u8])>,
     ) -> Result<Decoded, DecodingError> {
         let (consumed, result) = {
             let buf = self.reader.fill_buf()?;
@@ -79,11 +79,11 @@ impl<R: Read> ReadDecoder<R> {
     }
 
     fn decode_next_without_image_data(&mut self) -> Result<Decoded, DecodingError> {
-        self.decode_next(&mut |_| panic!("Unexpected image data"))
+        self.decode_next(Some(&mut |_| panic!("Unexpected image data")))
     }
 
     fn decode_next_and_discard_image_data(&mut self) -> Result<Decoded, DecodingError> {
-        self.decode_next(&mut |_image_data_to_discard| {})
+        self.decode_next(None)
     }
 
     /// Reads until the end of `IHDR` chunk.
@@ -127,6 +127,13 @@ impl<R: Read> ReadDecoder<R> {
         &mut self,
         image_data_callback: &mut dyn FnMut(&[u8]),
     ) -> Result<ImageDataCompletionStatus, DecodingError> {
+        self.decode_image_data_impl(Some(image_data_callback))
+    }
+
+    fn decode_image_data_impl(
+        &mut self,
+        image_data_callback: Option<&mut dyn FnMut(&[u8])>,
+    ) -> Result<ImageDataCompletionStatus, DecodingError> {
         match self.decode_next(image_data_callback)? {
             Decoded::ImageData => Ok(ImageDataCompletionStatus::ExpectingMoreData),
             Decoded::ImageDataFlushed => Ok(ImageDataCompletionStatus::Done),
@@ -146,8 +153,7 @@ impl<R: Read> ReadDecoder<R> {
     /// Prerequisite: Input is currently positioned within `IDAT` / `fdAT` chunk sequence.
     pub fn finish_decoding_image_data(&mut self) -> Result<(), DecodingError> {
         loop {
-            let mut discarder = |_data_to_discard: &[u8]| {};
-            if let ImageDataCompletionStatus::Done = self.decode_image_data(&mut discarder)? {
+            if let ImageDataCompletionStatus::Done = self.decode_image_data_impl(None)? {
                 return Ok(());
             }
         }
