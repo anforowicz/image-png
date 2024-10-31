@@ -15,7 +15,7 @@ pub(super) struct ZlibStream {
     /// The first index of `out_buffer` where new data can be written.
     out_pos: usize,
     /// The first index of `out_buffer` that hasn't yet been passed to our client
-    /// (i.e. not yet appended to the `image_data` parameter of `fn decompress` or `fn
+    /// (i.e. not yet passed to the `image_data_callback` parameter of `fn decompress` or `fn
     /// finish_compressed_chunks`).
     read_pos: usize,
     /// Limit on how many bytes can be decompressed in total.  This field is mostly used for
@@ -82,7 +82,7 @@ impl ZlibStream {
     pub(crate) fn decompress(
         &mut self,
         data: &[u8],
-        image_data: &mut Vec<u8>,
+        image_data_callback: &mut dyn FnMut(&[u8]),
     ) -> Result<usize, DecodingError> {
         // There may be more data past the adler32 checksum at the end of the deflate stream. We
         // match libpng's default behavior and ignore any trailing data. In the future we may want
@@ -106,7 +106,7 @@ impl ZlibStream {
 
         self.started = true;
         self.out_pos += out_consumed;
-        self.transfer_finished_data(image_data);
+        self.transfer_finished_data(image_data_callback);
         self.compact_out_buffer_if_needed();
 
         Ok(in_consumed)
@@ -119,7 +119,7 @@ impl ZlibStream {
     /// more data were passed to it.
     pub(crate) fn finish_compressed_chunks(
         &mut self,
-        image_data: &mut Vec<u8>,
+        image_data_callback: &mut dyn FnMut(&[u8]),
     ) -> Result<(), DecodingError> {
         if !self.started {
             return Ok(());
@@ -137,7 +137,7 @@ impl ZlibStream {
             self.out_pos += out_consumed;
 
             if !self.state.is_done() {
-                let transferred = self.transfer_finished_data(image_data);
+                let transferred = self.transfer_finished_data(image_data_callback);
                 assert!(
                     transferred > 0 || out_consumed > 0,
                     "No more forward progress made in stream decoding."
@@ -146,7 +146,7 @@ impl ZlibStream {
             }
         }
 
-        self.transfer_finished_data(image_data);
+        self.transfer_finished_data(image_data_callback);
         self.out_buffer.clear();
         Ok(())
     }
@@ -193,9 +193,9 @@ impl ZlibStream {
             .min(self.max_total_output)
     }
 
-    fn transfer_finished_data(&mut self, image_data: &mut Vec<u8>) -> usize {
+    fn transfer_finished_data(&mut self, image_data_callback: &mut dyn FnMut(&[u8])) -> usize {
         let transferred = &self.out_buffer[self.read_pos..self.out_pos];
-        image_data.extend_from_slice(transferred);
+        image_data_callback(transferred);
         self.read_pos = self.out_pos;
         transferred.len()
     }

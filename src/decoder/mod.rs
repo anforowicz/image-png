@@ -618,10 +618,10 @@ impl<R: Read> Reader<R> {
                 ));
             }
 
-            match self
+            let decoding_result = self
                 .decoder
-                .decode_image_data(self.unfiltered_rows.as_mut_vec())?
-            {
+                .decode_image_data(&mut self.unfiltered_rows.as_image_data_callback())?;
+            match decoding_result {
                 ImageDataCompletionStatus::ExpectingMoreData => (),
                 ImageDataCompletionStatus::Done => self.mark_subframe_as_consumed_and_flushed(),
             }

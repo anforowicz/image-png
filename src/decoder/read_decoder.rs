@@ -61,33 +61,29 @@ impl<R: Read> ReadDecoder<R> {
         self.decoder.set_ignore_crc(ignore_checksums);
     }
 
-    /// Returns the next decoded chunk. If the chunk is an ImageData chunk, its contents are written
-    /// into image_data.
-    fn decode_next(&mut self, image_data: &mut Vec<u8>) -> Result<Decoded, DecodingError> {
+    /// Returns the next decoded chunk. If the chunk is an ImageData chunk, its contents are passed
+    /// into `image_data_callback`.
+    fn decode_next(
+        &mut self,
+        image_data_callback: &mut dyn FnMut(&[u8]),
+    ) -> Result<Decoded, DecodingError> {
         let (consumed, result) = {
             let buf = self.reader.fill_buf()?;
             if buf.is_empty() {
                 return Err(DecodingError::IoError(ErrorKind::UnexpectedEof.into()));
             }
-            self.decoder.update(buf, image_data)?
+            self.decoder.update2(buf, image_data_callback)?
         };
         self.reader.consume(consumed);
         Ok(result)
     }
 
     fn decode_next_without_image_data(&mut self) -> Result<Decoded, DecodingError> {
-        // This is somewhat ugly. The API requires us to pass a buffer to decode_next but we
-        // know that we will stop before reading any image data from the stream. Thus pass an
-        // empty buffer and assert that remains empty.
-        let mut buf = Vec::new();
-        let state = self.decode_next(&mut buf)?;
-        assert!(buf.is_empty());
-        Ok(state)
+        self.decode_next(&mut |_| panic!("Unexpected image data"))
     }
 
     fn decode_next_and_discard_image_data(&mut self) -> Result<Decoded, DecodingError> {
-        let mut to_be_discarded = Vec::new();
-        self.decode_next(&mut to_be_discarded)
+        self.decode_next(&mut |_image_data_to_discard| {})
     }
 
     /// Reads until the end of `IHDR` chunk.
@@ -122,15 +118,16 @@ impl<R: Read> ReadDecoder<R> {
         Ok(())
     }
 
-    /// Reads `image_data` and reports whether there may be additional data afterwards (i.e. if it
-    /// is okay to call `decode_image_data` and/or `finish_decoding_image_data` again)..
+    /// Reads image data (passing it to `image_data_callback`) and reports whether there may be
+    /// additional data afterwards (i.e. if it is okay to call `decode_image_data` and/or
+    /// `finish_decoding_image_data` again).
     ///
     /// Prerequisite: Input is currently positioned within `IDAT` / `fdAT` chunk sequence.
     pub fn decode_image_data(
         &mut self,
-        image_data: &mut Vec<u8>,
+        image_data_callback: &mut dyn FnMut(&[u8]),
     ) -> Result<ImageDataCompletionStatus, DecodingError> {
-        match self.decode_next(image_data)? {
+        match self.decode_next(image_data_callback)? {
             Decoded::ImageData => Ok(ImageDataCompletionStatus::ExpectingMoreData),
             Decoded::ImageDataFlushed => Ok(ImageDataCompletionStatus::Done),
             // Ignore other events that may happen within an `IDAT` / `fdAT` chunks sequence.
@@ -149,8 +146,8 @@ impl<R: Read> ReadDecoder<R> {
     /// Prerequisite: Input is currently positioned within `IDAT` / `fdAT` chunk sequence.
     pub fn finish_decoding_image_data(&mut self) -> Result<(), DecodingError> {
         loop {
-            let mut to_be_discarded = vec![];
-            if let ImageDataCompletionStatus::Done = self.decode_image_data(&mut to_be_discarded)? {
+            let mut discarder = |_data_to_discard: &[u8]| {};
+            if let ImageDataCompletionStatus::Done = self.decode_image_data(&mut discarder)? {
                 return Ok(());
             }
         }

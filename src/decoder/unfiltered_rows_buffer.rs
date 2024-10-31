@@ -57,15 +57,9 @@ impl UnfilteredRowsBuffer {
         self.data_stream.len() - self.current_start
     }
 
-    /// Returns a `&mut Vec<u8>` suitable for passing to
+    /// Returns a callback suitable for passing to
     /// `ReadDecoder.decode_image_data` or `StreamingDecoder.update`.
-    ///
-    /// Invariants of `self` depend on the assumption that the caller will only
-    /// append new bytes to the returned vector (which is indeed the behavior of
-    /// `ReadDecoder` and `StreamingDecoder`).  TODO: Consider protecting the
-    /// invariants by returning an append-only view of the vector
-    /// (`FnMut(&[u8])`??? or maybe `std::io::Write`???).
-    pub fn as_mut_vec(&mut self) -> &mut Vec<u8> {
+    pub fn as_image_data_callback(&mut self) -> impl FnMut(&[u8]) + '_ {
         // Opportunistically compact the current buffer by discarding bytes
         // before `prev_start`.
         if self.prev_start > 0 {
@@ -77,7 +71,9 @@ impl UnfilteredRowsBuffer {
             self.debug_assert_invariants();
         }
 
-        &mut self.data_stream
+        move |new_data: &[u8]| {
+            self.data_stream.extend_from_slice(new_data);
+        }
     }
 
     /// Runs `unfilter` on the current row, and then shifts rows so that the current row becomes the previous row.
