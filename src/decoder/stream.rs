@@ -30,12 +30,6 @@ const CHECKSUM_DISABLED: bool = cfg!(fuzzing);
 /// Kind of `u32` value that is being read via `State::U32`.
 #[derive(Debug)]
 enum U32ValueKind {
-    /// First 4 bytes of the PNG signature - see
-    /// http://www.libpng.org/pub/png/spec/1.2/PNG-Structure.html#PNG-file-signature
-    Signature1stU32,
-    /// Second 4 bytes of the PNG signature - see
-    /// http://www.libpng.org/pub/png/spec/1.2/PNG-Structure.html#PNG-file-signature
-    Signature2ndU32,
     /// Chunk length - see
     /// http://www.libpng.org/pub/png/spec/1.2/PNG-Structure.html#Chunk-layout
     Length,
@@ -52,6 +46,8 @@ enum U32ValueKind {
 
 #[derive(Debug)]
 enum State {
+    /// In this state we are checking the first 16 bytes of the PNG file.
+    SignatureAndStartOfIHDR,
     /// In this state we are reading a u32 value.
     U32(U32ValueKind),
     /// In this state we are parsing chunk data.
@@ -549,7 +545,7 @@ impl StreamingDecoder {
         inflater.set_ignore_adler32(decode_options.ignore_adler32);
 
         StreamingDecoder {
-            state: Some(State::U32(U32ValueKind::Signature1stU32)),
+            state: Some(State::SignatureAndStartOfIHDR),
             current_chunk: ChunkState::default(),
             inflater,
             info: None,
@@ -565,7 +561,7 @@ impl StreamingDecoder {
 
     /// Resets the StreamingDecoder
     pub fn reset(&mut self) {
-        self.state = Some(State::U32(U32ValueKind::Signature1stU32));
+        self.state = Some(State::SignatureAndStartOfIHDR);
         self.current_chunk.crc = Crc32::new();
         self.current_chunk.length = 0;
         self.inflater.reset();
@@ -665,6 +661,35 @@ impl StreamingDecoder {
         let state = self.state.take().unwrap();
 
         match state {
+            SignatureAndStartOfIHDR => {
+                const EXPECTED: [u8; 16] = [
+                    137, 80, 78, 71, 13, 10, 26, 10, // PNG signature
+                    0, 0, 0, 13, // IHDR length - always 13
+                    73, 72, 68, 82, // "IHDR" in ASCII
+                ];
+                if buf.len() < EXPECTED.len() {
+                    self.state = Some(State::SignatureAndStartOfIHDR);
+                    Ok((0, Decoded::Nothing))
+                } else {
+                    if &buf[..EXPECTED.len()] == EXPECTED {
+                        self.current_chunk.type_ = IHDR;
+                        self.current_chunk.length = 13;
+                        self.current_chunk.crc.update(&IHDR.0);
+                        self.state = Some(State::ChunkData(IHDR));
+                        Ok((EXPECTED.len(), Decoded::Nothing))
+                    } else {
+                        const SIG_LEN: usize = 8;
+                        if &buf[..SIG_LEN] == &EXPECTED[..SIG_LEN] {
+                            self.state = Some(State::U32(U32ValueKind::Length));
+                            Ok((SIG_LEN, Decoded::Nothing))
+                        } else {
+                            Err(DecodingError::Format(
+                                FormatErrorInner::InvalidSignature.into(),
+                            ))
+                        }
+                    }
+                }
+            }
             U32(kind) => {
                 if buf.len() >= 4 {
                     match self.parse_u32(kind, &buf[0..4], image_data)? {
@@ -717,26 +742,6 @@ impl StreamingDecoder {
         let val = u32::from_be_bytes(bytes);
 
         match kind {
-            U32ValueKind::Signature1stU32 => {
-                if bytes == [137, 80, 78, 71] {
-                    self.state = Some(State::U32(U32ValueKind::Signature2ndU32));
-                    Ok(Decoded::Nothing)
-                } else {
-                    Err(DecodingError::Format(
-                        FormatErrorInner::InvalidSignature.into(),
-                    ))
-                }
-            }
-            U32ValueKind::Signature2ndU32 => {
-                if bytes == [13, 10, 26, 10] {
-                    self.state = Some(State::U32(U32ValueKind::Length));
-                    Ok(Decoded::Nothing)
-                } else {
-                    Err(DecodingError::Format(
-                        FormatErrorInner::InvalidSignature.into(),
-                    ))
-                }
-            }
             U32ValueKind::Length => {
                 self.state = Some(State::U32(U32ValueKind::Type { length: val }));
                 Ok(Decoded::Nothing)
