@@ -3,10 +3,74 @@ use super::stream::{
 };
 use super::Limits;
 
-use std::io::{BufRead, BufReader, ErrorKind, Read};
+use std::io::{ErrorKind, Read};
 
 use crate::chunk;
 use crate::common::Info;
+
+struct BufReader2<R: Read> {
+    buf: Vec<u8>,
+    read_pos: usize,
+    write_pos: usize,
+    reader: R,
+}
+
+impl<R: Read> BufReader2<R> {
+    fn assert_invariants(&self) {
+        debug_assert!(self.read_pos <= self.write_pos);
+        debug_assert!(self.write_pos <= self.buf.len());
+    }
+
+    fn new(reader: R) -> Self {
+        Self {
+            buf: vec![0; CHUNK_BUFFER_SIZE],
+            read_pos: 0,
+            write_pos: 0,
+            reader,
+        }
+    }
+
+    fn consume(&mut self, bytes: usize) {
+        self.read_pos += bytes;
+        self.assert_invariants();
+    }
+
+    fn buf(&self) -> &[u8] {
+        &self.buf[self.read_pos..self.write_pos]
+    }
+
+    fn fill_more_or_eof(&mut self, limits: &mut Limits) -> Result<(), DecodingError> {
+        if self.write_pos == self.buf.len() {
+            // Make room if needed:
+            if self.read_pos > 0 {
+                // By shifting by `self.read_pos`
+                self.buf.copy_within(self.read_pos.., 0);
+                self.write_pos -= self.read_pos;
+                self.read_pos = 0;
+            } else {
+                // Or by growing the buffer
+                limits.reserve_bytes(self.buf.len())?;
+                self.buf.resize(self.buf.len() * 2, 0);
+            }
+            self.assert_invariants();
+        }
+
+        let bytes = self
+            .reader
+            .read(&mut self.buf[self.write_pos..])
+            .and_then(|bytes| {
+                if bytes > 0 {
+                    Ok(bytes)
+                } else {
+                    Err(ErrorKind::UnexpectedEof.into())
+                }
+            })?;
+        self.write_pos += bytes;
+        self.assert_invariants();
+
+        Ok(())
+    }
+}
 
 /// Helper for encapsulating reading input from `Read` and feeding it into a `StreamingDecoder`
 /// while hiding low-level `Decoded` events and only exposing a few high-level reading operations
@@ -18,14 +82,14 @@ use crate::common::Info;
 /// * `finish_decoding_image_data()` - discarding remaining data from `IDAT` / `fdAT` sequence
 /// * `read_until_end_of_input()` - reading until `IEND` chunk
 pub(crate) struct ReadDecoder<R: Read> {
-    reader: BufReader<R>,
+    reader: BufReader2<R>,
     decoder: StreamingDecoder,
 }
 
 impl<R: Read> ReadDecoder<R> {
     pub fn new(r: R) -> Self {
         Self {
-            reader: BufReader::with_capacity(CHUNK_BUFFER_SIZE, r),
+            reader: BufReader2::new(r),
             decoder: StreamingDecoder::new(),
         }
     }
@@ -35,7 +99,7 @@ impl<R: Read> ReadDecoder<R> {
         decoder.limits = Limits::default();
 
         Self {
-            reader: BufReader::with_capacity(CHUNK_BUFFER_SIZE, r),
+            reader: BufReader2::new(r),
             decoder,
         }
     }
@@ -64,15 +128,15 @@ impl<R: Read> ReadDecoder<R> {
     /// Returns the next decoded chunk. If the chunk is an ImageData chunk, its contents are written
     /// into image_data.
     fn decode_next(&mut self, image_data: &mut Vec<u8>) -> Result<Decoded, DecodingError> {
-        let (consumed, result) = {
-            let buf = self.reader.fill_buf()?;
-            if buf.is_empty() {
-                return Err(DecodingError::IoError(ErrorKind::UnexpectedEof.into()));
+        loop {
+            match self.decoder.update(self.reader.buf(), image_data)? {
+                (0, Decoded::Nothing) => self.reader.fill_more_or_eof(&mut self.decoder.limits)?,
+                (consumed, decoded) => {
+                    self.reader.consume(consumed);
+                    return Ok(decoded);
+                }
             }
-            self.decoder.update(buf, image_data)?
-        };
-        self.reader.consume(consumed);
-        Ok(result)
+        }
     }
 
     fn decode_next_without_image_data(&mut self) -> Result<Decoded, DecodingError> {
