@@ -1,13 +1,11 @@
 use super::{stream::FormatErrorInner, DecodingError, CHUNK_BUFFER_SIZE};
 
-use fdeflate::Decompressor;
+use fdeflate::{DecompressedRead, Decompressor, GenericDecompressor};
 
 /// Ergonomics wrapper around `miniz_oxide::inflate::stream` for zlib compressed data.
 pub(super) struct ZlibStream {
     /// Current decoding state.
-    state: Box<fdeflate::Decompressor>,
-    /// If there has been a call to decompress already.
-    started: bool,
+    state: Option<Box<dyn fdeflate::DecompressedRead>>,
     /// Remaining buffered decoded bytes.
     /// The decoder sometimes wants inspect some already finished bytes for further decoding. So we
     /// keep a total of 32KB of decoded data available as long as more data may be appended.
@@ -33,8 +31,7 @@ pub(super) struct ZlibStream {
 impl ZlibStream {
     pub(crate) fn new() -> Self {
         ZlibStream {
-            state: Box::new(Decompressor::new()),
-            started: false,
+            state: None,
             out_buffer: Vec::new(),
             out_pos: 0,
             read_pos: 0,
@@ -44,12 +41,11 @@ impl ZlibStream {
     }
 
     pub(crate) fn reset(&mut self) {
-        self.started = false;
+        self.state = None;
         self.out_buffer.clear();
         self.out_pos = 0;
         self.read_pos = 0;
         self.max_total_output = usize::MAX;
-        *self.state = Decompressor::new();
     }
 
     pub(crate) fn set_max_total_output(&mut self, n: usize) {
@@ -64,7 +60,7 @@ impl ZlibStream {
     /// This flag cannot be modified after decompression has started until the
     /// [ZlibStream] is reset.
     pub(crate) fn set_ignore_adler32(&mut self, flag: bool) -> bool {
-        if !self.started {
+        if self.state.is_none() {
             self.ignore_adler32 = flag;
             true
         } else {
@@ -84,27 +80,40 @@ impl ZlibStream {
         data: &[u8],
         image_data: &mut Vec<u8>,
     ) -> Result<usize, DecodingError> {
-        // There may be more data past the adler32 checksum at the end of the deflate stream. We
-        // match libpng's default behavior and ignore any trailing data. In the future we may want
-        // to add a flag to control this behavior.
-        if self.state.is_done() {
-            return Ok(data.len());
+        if self.state.is_none() {
+            self.state = Some(if self.max_total_output > 3000 {
+                let mut d = Decompressor::new();
+                if self.ignore_adler32 {
+                    d.ignore_adler32();
+                }
+                Box::new(d) as Box<dyn DecompressedRead>
+            } else {
+                let mut d = GenericDecompressor::<512, 128>::new();
+                if self.ignore_adler32 {
+                    d.ignore_adler32();
+                }
+                Box::new(d)
+            });
+        } else {
+            // There may be more data past the adler32 checksum at the end of the deflate stream.
+            // We match libpng's default behavior and ignore any trailing data. In the future we
+            // may want to add a flag to control this behavior.
+            if self.state.as_ref().unwrap().is_done() {
+                return Ok(data.len());
+            }
         }
 
         self.prepare_vec_for_appending();
 
-        if !self.started && self.ignore_adler32 {
-            self.state.ignore_adler32();
-        }
-
         let (in_consumed, out_consumed) = self
             .state
+            .as_mut()
+            .unwrap()
             .read(data, self.out_buffer.as_mut_slice(), self.out_pos, false)
             .map_err(|err| {
                 DecodingError::Format(FormatErrorInner::CorruptFlateStream { err }.into())
             })?;
 
-        self.started = true;
         self.out_pos += out_consumed;
         self.transfer_finished_data(image_data);
         self.compact_out_buffer_if_needed();
@@ -121,14 +130,16 @@ impl ZlibStream {
         &mut self,
         image_data: &mut Vec<u8>,
     ) -> Result<(), DecodingError> {
-        if !self.started {
+        if self.state.is_none() {
             return Ok(());
         }
 
-        while !self.state.is_done() {
+        while !self.state.as_ref().unwrap().is_done() {
             self.prepare_vec_for_appending();
             let (_in_consumed, out_consumed) = self
                 .state
+                .as_mut()
+                .unwrap()
                 .read(&[], self.out_buffer.as_mut_slice(), self.out_pos, true)
                 .map_err(|err| {
                     DecodingError::Format(FormatErrorInner::CorruptFlateStream { err }.into())
@@ -136,7 +147,7 @@ impl ZlibStream {
 
             self.out_pos += out_consumed;
 
-            if !self.state.is_done() {
+            if !self.state.as_ref().unwrap().is_done() {
                 let transferred = self.transfer_finished_data(image_data);
                 assert!(
                     transferred > 0 || out_consumed > 0,
@@ -155,7 +166,7 @@ impl ZlibStream {
     fn prepare_vec_for_appending(&mut self) {
         // The `debug_assert` below explains why we can use `>=` instead of `>` in the condition
         // that compares `self.out_post >= self.max_total_output` in the next `if` statement.
-        debug_assert!(!self.state.is_done());
+        debug_assert!(!self.state.as_ref().unwrap().is_done());
         if self.out_pos >= self.max_total_output {
             // This can happen when the `max_total_output` was miscalculated (e.g.
             // because the `IHDR` chunk was malformed and didn't match the `IDAT` chunk).  In
