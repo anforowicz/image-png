@@ -318,6 +318,10 @@ struct SubframeInfo {
 }
 
 impl<R: Read> Reader<R> {
+    pub fn idat_size(&self) -> u32 {
+        self.decoder.idat_size()
+    }
+
     /// Advances to the start of the next animation frame and
     /// returns a reference to the `FrameControl` info that describes it.
     /// Skips and discards the image data of the previous frame if necessary.

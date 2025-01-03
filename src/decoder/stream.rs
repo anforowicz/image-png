@@ -540,6 +540,7 @@ pub struct StreamingDecoder {
     have_iccp: bool,
     decode_options: DecodeOptions,
     pub(crate) limits: Limits,
+    idat_size_field: Option<u32>,
 }
 
 struct ChunkState {
@@ -581,6 +582,7 @@ impl StreamingDecoder {
             ready_for_fdat_chunks: false,
             decode_options,
             limits: Limits { bytes: usize::MAX },
+            idat_size_field: None,
         }
     }
 
@@ -639,6 +641,10 @@ impl StreamingDecoder {
     pub fn set_skip_ancillary_crc_failures(&mut self, skip_ancillary_crc_failures: bool) {
         self.decode_options
             .set_skip_ancillary_crc_failures(skip_ancillary_crc_failures)
+    }
+
+    pub fn idat_size(&self) -> u32 {
+        self.idat_size_field.unwrap()
     }
 
     /// Low level StreamingDecoder interface.
@@ -863,6 +869,9 @@ impl StreamingDecoder {
                                 FormatErrorInner::FdatShorterThanFourBytes.into(),
                             ));
                         }
+                        if self.idat_size_field.is_none() {
+                            self.idat_size_field = Some(length);
+                        }
                         Some(State::new_u32(U32ValueKind::ApngSequenceNumber))
                     }
                     IDAT => {
@@ -875,6 +884,9 @@ impl StreamingDecoder {
                             ));
                         }
                         self.have_idat = true;
+                        if self.idat_size_field.is_none() {
+                            self.idat_size_field = Some(length);
+                        }
                         Some(State::ImageData(type_str))
                     }
                     _ => Some(State::ReadChunkData(type_str)),

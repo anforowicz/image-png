@@ -148,7 +148,6 @@ impl ZlibStream {
 
         self.transfer_finished_data(image_data);
         self.out_buffer.clear();
-        self.state.dump_stats();
         Ok(())
     }
 
