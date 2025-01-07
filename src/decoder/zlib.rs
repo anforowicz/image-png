@@ -31,6 +31,10 @@ pub(super) struct ZlibStream {
 }
 
 impl ZlibStream {
+    pub fn block_properties(&self) -> Option<&fdeflate::huffman::BlockProperties> {
+        self.state.get_first_block_properties()
+    }
+
     pub(crate) fn new() -> Self {
         ZlibStream {
             state: Box::new(Decompressor::new()),

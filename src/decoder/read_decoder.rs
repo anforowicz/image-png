@@ -23,6 +23,14 @@ pub(crate) struct ReadDecoder<R: Read> {
 }
 
 impl<R: Read> ReadDecoder<R> {
+    pub fn idat_size(&self) -> u32 {
+        self.decoder.idat_size()
+    }
+
+    pub fn block_properties(&self) -> Option<&fdeflate::huffman::BlockProperties> {
+        self.decoder.block_properties()
+    }
+
     pub fn new(r: R) -> Self {
         Self {
             reader: BufReader::with_capacity(CHUNK_BUFFER_SIZE, r),

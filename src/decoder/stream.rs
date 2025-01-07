@@ -540,6 +540,8 @@ pub struct StreamingDecoder {
     have_iccp: bool,
     decode_options: DecodeOptions,
     pub(crate) limits: Limits,
+    idat_size_field: Option<u32>,
+    block_properties_field: Option<fdeflate::huffman::BlockProperties>,
 }
 
 struct ChunkState {
@@ -581,6 +583,8 @@ impl StreamingDecoder {
             ready_for_fdat_chunks: false,
             decode_options,
             limits: Limits { bytes: usize::MAX },
+            idat_size_field: None,
+            block_properties_field: None,
         }
     }
 
@@ -639,6 +643,14 @@ impl StreamingDecoder {
     pub fn set_skip_ancillary_crc_failures(&mut self, skip_ancillary_crc_failures: bool) {
         self.decode_options
             .set_skip_ancillary_crc_failures(skip_ancillary_crc_failures)
+    }
+
+    pub fn idat_size(&self) -> u32 {
+        self.idat_size_field.unwrap()
+    }
+
+    pub fn block_properties(&self) -> Option<&fdeflate::huffman::BlockProperties> {
+        self.block_properties_field.as_ref()
     }
 
     /// Low level StreamingDecoder interface.
@@ -837,6 +849,9 @@ impl StreamingDecoder {
                     && (self.current_chunk.type_ == IDAT || self.current_chunk.type_ == chunk::fdAT)
                 {
                     self.current_chunk.type_ = type_str;
+                    if self.block_properties_field.is_none() {
+                        self.block_properties_field = self.inflater.block_properties().map(|p| p.clone());
+                    }
                     self.inflater.finish_compressed_chunks(image_data)?;
                     self.inflater.reset();
                     self.ready_for_idat_chunks = false;
@@ -863,6 +878,9 @@ impl StreamingDecoder {
                                 FormatErrorInner::FdatShorterThanFourBytes.into(),
                             ));
                         }
+                        if self.idat_size_field.is_none() {
+                            self.idat_size_field = Some(length);
+                        }
                         Some(State::new_u32(U32ValueKind::ApngSequenceNumber))
                     }
                     IDAT => {
@@ -875,6 +893,9 @@ impl StreamingDecoder {
                             ));
                         }
                         self.have_idat = true;
+                        if self.idat_size_field.is_none() {
+                            self.idat_size_field = Some(length);
+                        }
                         Some(State::ImageData(type_str))
                     }
                     _ => Some(State::ReadChunkData(type_str)),
